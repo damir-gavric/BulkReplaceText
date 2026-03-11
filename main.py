@@ -325,7 +325,7 @@ def _build_map_group_preview(text: str, group_hits: list[tuple], left: int, righ
         after_spans.append((out_cursor, out_cursor + len(new)))
         out_cursor += len(new)
         cursor = end
-        labels.append(f"{html.escape(old)} &rarr; {html.escape(new)}")
+        labels.append(f"{old} -> {new}")
 
     after_parts.append(text[cursor:right])
     after_snippet = "".join(after_parts)
