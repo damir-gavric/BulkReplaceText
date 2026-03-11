@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Bulk Replace icon">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#94A3B8" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="#F8FAFC"/>
+
+  <g filter="url(#shadow)">
+    <path d="M58 28h102l38 38v138c0 13.255-10.745 24-24 24H58c-13.255 0-24-10.745-24-24V52c0-13.255 10.745-24 24-24z" fill="#FFFFFF"/>
+    <path d="M160 28v30c0 11.046 8.954 20 20 20h18z" fill="#E2E8F0"/>
+    <path d="M160 28l38 38h-18c-11.046 0-20-8.954-20-20z" fill="#CBD5E1"/>
+    <path d="M58 28h102l38 38v138c0 13.255-10.745 24-24 24H58c-13.255 0-24-10.745-24-24V52c0-13.255 10.745-24 24-24z" fill="none" stroke="#CBD5E1" stroke-width="4"/>
+  </g>
+
+  <line x1="116" y1="74" x2="116" y2="202" stroke="#CBD5E1" stroke-width="3"/>
+
+  <rect x="58" y="84" width="40" height="12" rx="6" fill="#FDE6B6"/>
+  <rect x="62" y="86" width="28" height="8" rx="4" fill="#D97706"/>
+  <rect x="58" y="106" width="48" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="58" y="124" width="42" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="58" y="142" width="34" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="58" y="164" width="30" height="12" rx="6" fill="#FDE6B6"/>
+  <rect x="62" y="166" width="20" height="8" rx="4" fill="#D97706"/>
+  <rect x="58" y="184" width="46" height="10" rx="5" fill="#E2E8F0"/>
+
+  <rect x="134" y="84" width="44" height="12" rx="6" fill="#D9F99D"/>
+  <rect x="138" y="86" width="30" height="8" rx="4" fill="#15803D"/>
+  <rect x="134" y="106" width="40" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="134" y="124" width="50" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="134" y="142" width="36" height="10" rx="5" fill="#E2E8F0"/>
+  <rect x="134" y="164" width="54" height="12" rx="6" fill="#D9F99D"/>
+  <rect x="138" y="166" width="38" height="8" rx="4" fill="#15803D"/>
+  <rect x="134" y="184" width="42" height="10" rx="5" fill="#E2E8F0"/>
+
+  <path d="M103 128h34" stroke="#64748B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M129 116l16 12-16 12" fill="none" stroke="#64748B" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
