@@ -2,14 +2,17 @@ import os
 import sys
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QLineEdit, QPushButton, QCheckBox,
+    QLabel, QLineEdit, QPushButton, QCheckBox,
     QTabWidget, QSplitter, QListWidget, QTextEdit, QFileDialog,
-    QMessageBox, QListWidgetItem, QSizePolicy
+    QMessageBox, QListWidgetItem, QFrame,
+    QPlainTextEdit, QStatusBar, QToolButton
 )
-from PyQt6.QtGui import QPalette, QColor, QDesktopServices, QTextCursor
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QPalette, QColor, QTextCursor, QTextCharFormat, QIcon
+from PyQt6.QtCore import Qt
 
 import html
+import re
+import shutil
 
 
 # -----------------------------
@@ -30,18 +33,26 @@ def read_text_file(path: str):
     if is_probably_binary(raw):
         return None
 
+    newline = ""
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
         try:
-            return raw.decode(enc)
+            text = raw.decode(enc)
+            if "\r\n" in text:
+                newline = "\r\n"
+            elif "\n" in text:
+                newline = "\n"
+            elif "\r" in text:
+                newline = "\r"
+            return text, enc, newline
         except UnicodeDecodeError:
             continue
 
     return None
 
 
-def write_text_file(path: str, text: str):
+def write_text_file(path: str, text: str, encoding: str = "utf-8", newline: str = ""):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    with open(path, "w", encoding=encoding, newline="") as f:
         f.write(text)
 
 
@@ -58,38 +69,57 @@ def parse_extensions(csv: str) -> set[str]:
 
 
 # -----------------------------
+# App resources
+# -----------------------------
+
+def resource_path(*parts: str) -> str:
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, *parts)
+
+
+def load_app_icon() -> QIcon:
+    icon_path = resource_path("assets", "app_icon.ico")
+    if os.path.exists(icon_path):
+        return QIcon(icon_path)
+    return QIcon()
+
+
+# -----------------------------
 # Replacement map helpers
 # -----------------------------
 
 def load_replacements_map(map_path: str):
-    """
-    File format:
-      old;new
-    Skips empty lines and lines starting with #.
-    Returns dict old->new
-    """
     try:
         with open(map_path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
     except Exception as e:
-        return None, f"Ne mogu da pročitam map file:\n{e}"
+        return None, f"Ne mogu da procitam map file:\n{e}"
 
     repl = {}
     warnings = []
 
-    for line in lines:
+    for line_no, line in enumerate(lines, start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if ";" not in line:
-            warnings.append(f"Preskačem liniju (nema ';'): {line}")
+            warnings.append(f"Preskacem liniju {line_no} (nema ';' ): {line}")
             continue
 
         old, new = line.split(";", 1)
         old, new = old.strip(), new.strip()
 
         if not old:
-            warnings.append(f"Preskačem liniju (prazan 'stari' string): {line}")
+            warnings.append(f"Preskacem liniju {line_no} (prazan 'stari' string): {line}")
+            continue
+
+        if old in repl and repl[old] != new:
+            warnings.append(
+                f"Konflikt za '{old}' na liniji {line_no}: zadrzavam '{repl[old]}', preskacem '{new}'"
+            )
+            continue
+        if old in repl:
+            warnings.append(f"Duplikat za '{old}' na liniji {line_no}: isti target, preskacem")
             continue
 
         repl[old] = new
@@ -142,115 +172,270 @@ def scan_files(folder: str, include_subfolders: bool, exts: set[str]) -> list[st
     return paths
 
 
-def build_preview_single(text: str, old: str, new: str, max_examples: int = 5, context: int = 60):
+def _make_pattern(old: str, case_sensitive: bool, whole_word: bool) -> re.Pattern:
+    """Compile a regex pattern with the given flags."""
+    pattern = re.escape(old)
+    if whole_word:
+        pattern = r'\b' + pattern + r'\b'
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(pattern, flags)
+
+
+
+def _make_preview_payload(snippet: str, spans: list[tuple[int, int]], bg_color: str, text_color: str):
+    clean_spans = []
+    cursor = 0
+    for start, end in sorted(spans):
+        start = max(0, min(start, len(snippet)))
+        end = max(start, min(end, len(snippet)))
+        if start < cursor:
+            continue
+        clean_spans.append((start, end))
+        cursor = end
+    return snippet, clean_spans, bg_color, text_color
+
+def _expand_preview_to_lines(text: str, start: int, end: int, pad_lines: int = 1):
+    left = start
+    right = end
+
+    for _ in range(pad_lines):
+        prev_nl = text.rfind("\n", 0, left - 1 if left > 0 else 0)
+        if prev_nl == -1:
+            left = 0
+            break
+        left = prev_nl
+
+    if left > 0 and text[left] == "\n":
+        left += 1
+
+    for _ in range(pad_lines + 1):
+        next_nl = text.find("\n", right)
+        if next_nl == -1:
+            right = len(text)
+            break
+        right = next_nl + 1
+
+    return left, right
+
+
+def _group_hits_for_preview(text: str, hits: list[tuple], pad_lines: int = 1):
+    groups = []
+    for hit in hits:
+        start, end = hit[0], hit[1]
+        left, right = _expand_preview_to_lines(text, start, end, pad_lines=pad_lines)
+        if groups and left <= groups[-1][1]:
+            groups[-1][1] = max(groups[-1][1], right)
+            groups[-1][2].append(hit)
+        else:
+            groups.append([left, right, [hit]])
+    return groups
+
+
+def _build_single_group_preview(text: str, group_hits: list[tuple], left: int, right: int, replacement: str):
+    snippet = text[left:right]
+    before_spans = []
+    after_parts = []
+    after_spans = []
+    cursor = left
+    out_cursor = 0
+
+    for start, end, matched in group_hits:
+        before_spans.append((start - left, end - left))
+        unchanged = text[cursor:start]
+        after_parts.append(unchanged)
+        out_cursor += len(unchanged)
+        after_parts.append(replacement)
+        after_spans.append((out_cursor, out_cursor + len(replacement)))
+        out_cursor += len(replacement)
+        cursor = end
+
+    after_parts.append(text[cursor:right])
+    after_snippet = "".join(after_parts)
+    return (
+        _make_preview_payload(snippet, before_spans, "#ffe2b8", "#7a4300"),
+        _make_preview_payload(after_snippet, after_spans, "#cfeecf", "#165b2a"),
+    )
+
+
+def build_preview_single(
+    text: str, old: str, new: str,
+    case_sensitive: bool = True, whole_word: bool = False,
+    max_examples: int = 5, context: int = 60
+):
     examples = []
     if not old:
         return examples
+    try:
+        pattern = _make_pattern(old, case_sensitive, whole_word)
+    except re.error:
+        return examples
 
-    start = 0
-    for _ in range(max_examples):
-        idx = text.find(old, start)
-        if idx == -1:
-            break
+    hits = [(m.start(), m.end(), m.group(0)) for m in pattern.finditer(text)]
+    if not hits:
+        return examples
 
-        left = max(0, idx - context)
-        right = min(len(text), idx + len(old) + context)
-
-        # Grab raw strings
-        before_raw = text[left:right]
-        # Replace the first instance of 'old' in the context slice
-        after_raw = before_raw.replace(old, new, 1)
-
-        # Convert to HTML format for rendering
-        # Escape HTML so actual tags in the source text aren't rendered as layout
-        b_html = html.escape(before_raw)
-        a_html = html.escape(after_raw)
-
-        # Wrap the target tokens in bold tags (escape the tokens themselves first to match)
-        b_html = b_html.replace(html.escape(old), f"<b><font color='#e07b00'>{html.escape(old)}</font></b>", 1)
-        a_html = a_html.replace(html.escape(new), f"<b><font color='#2e9e4f'>{html.escape(new)}</font></b>", 1)
-
-        # Preserve whitespace visually
-        b_html = b_html.replace("\n", "<br>").replace(" ", "&nbsp;")
-        a_html = a_html.replace("\n", "<br>").replace(" ", "&nbsp;")
-
-        examples.append((b_html, a_html))
-        start = idx + len(old)
+    for left, right, group_hits in _group_hits_for_preview(text, hits, pad_lines=1)[:max_examples]:
+        examples.append(_build_single_group_preview(text, group_hits, left, right, new))
 
     return examples
 
 
-def build_preview_map(text: str, replacements: dict, max_examples: int = 6, context: int = 60):
-    """
-    Shows examples across multiple pairs.
-    Returns list of (label, before, after) up to max_examples total.
-    """
-    out = []
+def _collect_non_overlapping_map_hits(
+    text: str, replacements: dict,
+    case_sensitive: bool = True, whole_word: bool = False
+):
+    all_hits = []
+    for old, new in replacements.items():
+        try:
+            pattern = _make_pattern(old, case_sensitive, whole_word)
+        except re.error:
+            continue
+        for m in pattern.finditer(text):
+            all_hits.append((m.start(), m.end(), m.group(0), old, new))
+
+    all_hits.sort(key=lambda h: (h[0], -(h[1] - h[0]), h[3]))
+
+    accepted = []
+    cursor = 0
+    for hit in all_hits:
+        start, end, _, _, _ = hit
+        if start < cursor:
+            continue
+        accepted.append(hit)
+        cursor = end
+
+    return accepted
+
+
+def _build_map_group_preview(text: str, group_hits: list[tuple], left: int, right: int):
+    snippet = text[left:right]
+    before_spans = []
+    after_parts = []
+    after_spans = []
+    cursor = left
+    out_cursor = 0
+    labels = []
+
+    for start, end, matched, old, new in group_hits:
+        before_spans.append((start - left, end - left))
+        unchanged = text[cursor:start]
+        after_parts.append(unchanged)
+        out_cursor += len(unchanged)
+        after_parts.append(new)
+        after_spans.append((out_cursor, out_cursor + len(new)))
+        out_cursor += len(new)
+        cursor = end
+        labels.append(f"{html.escape(old)} &rarr; {html.escape(new)}")
+
+    after_parts.append(text[cursor:right])
+    after_snippet = "".join(after_parts)
+    label = " | ".join(labels)
+    return (
+        label,
+        _make_preview_payload(snippet, before_spans, "#ffe2b8", "#7a4300"),
+        _make_preview_payload(after_snippet, after_spans, "#cfeecf", "#165b2a"),
+    )
+
+
+def build_preview_map(
+    text: str, replacements: dict,
+    case_sensitive: bool = True, whole_word: bool = False,
+    max_examples: int = 10, context: int = 60
+):
     if not replacements:
-        return out
+        return []
 
-    # deterministic order: longest 'old' first (reduces "small token" noise in preview)
-    items = sorted(replacements.items(), key=lambda kv: len(kv[0]), reverse=True)
+    hits = _collect_non_overlapping_map_hits(text, replacements, case_sensitive, whole_word)
+    if not hits:
+        return []
 
-    for old, new in items:
-        if len(out) >= max_examples:
-            break
-        start = 0
-        found_any = False
-
-        # find first match only for each pair (preview should be short)
-        idx = text.find(old, start)
-        if idx != -1:
-            found_any = True
-            left = max(0, idx - context)
-            right = min(len(text), idx + len(old) + context)
-
-            before_raw = text[left:right]
-            after_raw = before_raw.replace(old, new, 1)
-
-            b_html = html.escape(before_raw)
-            a_html = html.escape(after_raw)
-
-            b_html = b_html.replace(html.escape(old), f"<b><font color='#e07b00'>{html.escape(old)}</font></b>", 1)
-            a_html = a_html.replace(html.escape(new), f"<b><font color='#2e9e4f'>{html.escape(new)}</font></b>", 1)
-
-            b_html = b_html.replace("\n", "<br>").replace(" ", "&nbsp;")
-            a_html = a_html.replace("\n", "<br>").replace(" ", "&nbsp;")
-
-            out.append((f"{html.escape(old)}  &rarr;  {html.escape(new)}", b_html, a_html))
-
-        if found_any and len(out) >= max_examples:
-            break
-
+    out = []
+    for left, right, group_hits in _group_hits_for_preview(text, hits, pad_lines=1)[:max_examples]:
+        out.append(_build_map_group_preview(text, group_hits, left, right))
     return out
 
 
-def apply_replacements(text: str, mode: str, old: str, new: str, replacements_map: dict):
-    """
-    Returns (new_text, total_replacements_count, per_pair_counts_dict)
-    """
+def apply_replacements(
+    text: str, mode: str, old: str, new: str, replacements_map: dict,
+    case_sensitive: bool = True, whole_word: bool = False
+):
+    """Returns (new_text, total_count, per_pair_dict)."""
     if mode == "single":
         if not old:
             return text, 0, {}
-        c = text.count(old)
-        return text.replace(old, new), c, {f"{old} → {new}": c}
+        try:
+            pattern = _make_pattern(old, case_sensitive, whole_word)
+        except re.error:
+            return text, 0, {}
+        c = len(pattern.findall(text))
+        result = pattern.sub(new, text)
+        return result, c, {f"{old} -> {new}": c}
 
-    # mode == "map"
     if not replacements_map:
         return text, 0, {}
 
+    hits = _collect_non_overlapping_map_hits(text, replacements_map, case_sensitive, whole_word)
+    if not hits:
+        return text, 0, {}
+
+    out_parts = []
     per = {}
-    # apply in deterministic order (longest first)
-    items = sorted(replacements_map.items(), key=lambda kv: len(kv[0]), reverse=True)
-    new_text = text
-    total = 0
-    for o, n in items:
-        c = new_text.count(o)
-        if c:
-            new_text = new_text.replace(o, n)
-            per[f"{o} → {n}"] = c
-            total += c
-    return new_text, total, per
+    cursor = 0
+    for start, end, _, old_key, new_value in hits:
+        out_parts.append(text[cursor:start])
+        out_parts.append(new_value)
+        cursor = end
+        pair_key = f"{old_key} -> {new_value}"
+        per[pair_key] = per.get(pair_key, 0) + 1
+    out_parts.append(text[cursor:])
+
+    return "".join(out_parts), len(hits), per
+
+
+# -----------------------------
+# Styled widgets
+# -----------------------------
+
+class SectionHeader(QLabel):
+    """Small uppercase section label used above panels."""
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setObjectName("SectionHeader")
+
+
+class PillButton(QPushButton):
+    """Standard action button with rounded corners via stylesheet."""
+    def __init__(self, text: str, variant: str = "default", parent=None):
+        super().__init__(text, parent)
+        self.variant = variant
+        self.setObjectName(f"PillButton_{variant}")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+
+class FolderBar(QFrame):
+    """Top bar showing selected folder path."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FolderBar")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+
+        icon_lbl = QLabel("DIR")
+        icon_lbl.setObjectName("FolderTag")
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setFixedWidth(36)
+        layout.addWidget(icon_lbl)
+
+        self.path_edit = QLineEdit()
+        self.path_edit.setReadOnly(True)
+        self.path_edit.setPlaceholderText("No folder selected - drag and drop a folder here or click Browse")
+        self.path_edit.setObjectName("FolderPathEdit")
+        layout.addWidget(self.path_edit, 1)
+
+        self.btn_browse = PillButton("Browse...", "secondary")
+        self.btn_browse.setFixedWidth(90)
+        layout.addWidget(self.btn_browse)
 
 
 # -----------------------------
@@ -260,269 +445,602 @@ def apply_replacements(text: str, mode: str, old: str, new: str, replacements_ma
 class BulkReplaceApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Bulk Replace with Preview (Single + Map)")
-        self.resize(1200, 700)
-
-        # Enable dropping files/folders directly onto the window
+        self.setWindowTitle("Bulk Replace with Preview")
+        self.setWindowIcon(load_app_icon())
+        self.resize(1280, 760)
+        self.setMinimumSize(900, 560)
         self.setAcceptDrops(True)
 
         self.source_folder = ""
         self.file_paths: list[str] = []
         self.map_file_path = ""
         self.replacements_map = {}
+        self._is_dark = False
+        self._before_example_positions = []
+        self._after_example_positions = []
+        self._syncing_preview = False
+        self._preview_sync_enabled = False
 
-        # Main central widget
+        # Status bar
+        self.status_bar = QStatusBar()
+        self.status_bar.setObjectName("AppStatusBar")
+        self.setStatusBar(self.status_bar)
+        self._status_file_count = QLabel("No folder loaded")
+        self._status_match = QLabel("")
+        self.status_bar.addWidget(self._status_file_count)
+        self.status_bar.addPermanentWidget(self._status_match)
+
+        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(8)
+        self.folder_bar = FolderBar()
+        self.folder_bar.btn_browse.clicked.connect(self.on_select_folder)
+        root.addWidget(self.folder_bar)
+        opts_row = QHBoxLayout()
+        opts_row.setSpacing(12)
+        opts_row.setContentsMargins(0, 2, 0, 2)
 
-        # --- Top Controls ---
-        top_layout = QGridLayout()
+        ext_label = QLabel("Extensions:")
+        ext_label.setObjectName("OptionLabel")
+        opts_row.addWidget(ext_label)
 
-        top_layout.addWidget(QLabel("Folder:"), 0, 0)
-        self.folder_label = QLabel("(not selected)")
-        self.folder_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        top_layout.addWidget(self.folder_label, 0, 1)
-
-        btn_sel_folder = QPushButton("Select folder...")
-        btn_sel_folder.clicked.connect(self.on_select_folder)
-        top_layout.addWidget(btn_sel_folder, 0, 2)
-
-        top_layout.addWidget(QLabel("Extensions:"), 1, 0)
         self.ext_entry = QLineEdit()
         self.ext_entry.setText(".txt,.md,.html,.xhtml,.css,.sql,.ddl,.dml,.psql,.mysql,.plsql,.tsql,.prc,.fnc,.vw")
-        top_layout.addWidget(self.ext_entry, 1, 1, 1, 2)
+        self.ext_entry.setObjectName("ExtEntry")
+        self.ext_entry.setMinimumWidth(300)
+        opts_row.addWidget(self.ext_entry, 1)
+        self.ext_entry.textChanged.connect(self._auto_rescan)
 
         self.include_sub = QCheckBox("Include subfolders")
         self.include_sub.setChecked(True)
-        top_layout.addWidget(self.include_sub, 2, 1)
+        self.include_sub.toggled.connect(self._auto_rescan)
+        opts_row.addWidget(self.include_sub)
 
-        # Theme toggle
-        self.theme_checkbox = QCheckBox("Dark Theme")
-        self.theme_checkbox.setChecked(False)  # Light by default initially
-        self.theme_checkbox.toggled.connect(self.toggle_theme)
-        top_layout.addWidget(self.theme_checkbox, 2, 2, alignment=Qt.AlignmentFlag.AlignRight)
+        opts_row.addStretch()
 
-        main_layout.addLayout(top_layout)
+        self.theme_btn = QToolButton()
+        self.theme_btn.setText("Light")
+        self.theme_btn.setObjectName("ThemeToggle")
+        self.theme_btn.setCheckable(True)
+        self.theme_btn.setChecked(False)
+        self.theme_btn.toggled.connect(self._on_theme_toggle)
+        self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        opts_row.addWidget(self.theme_btn)
 
-        # --- Settings Area (Tabs) ---
+        root.addLayout(opts_row)
+        root.addWidget(self._make_divider())
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("ReplaceTabs")
+        self.tabs.setDocumentMode(False)
 
-        # Single Tab
-        self.single_tab = QWidget()
-        single_layout = QGridLayout(self.single_tab)
-        single_layout.addWidget(QLabel("Text to replace:"), 0, 0)
+        # Single tab
+        single_tab = QWidget()
+        single_layout = QHBoxLayout(single_tab)
+        single_layout.setContentsMargins(12, 10, 12, 10)
+        single_layout.setSpacing(14)
+
+        single_layout.addWidget(QLabel("Find:"))
         self.old_entry = QLineEdit()
+        self.old_entry.setPlaceholderText("Text to replace...")
+        self.old_entry.setObjectName("FindEntry")
         self.old_entry.textChanged.connect(self.on_file_select)
-        single_layout.addWidget(self.old_entry, 0, 1)
+        single_layout.addWidget(self.old_entry, 1)
 
-        single_layout.addWidget(QLabel("Replace with:"), 1, 0)
+        arrow = QLabel("->")
+        arrow.setObjectName("ArrowLabel")
+        single_layout.addWidget(arrow)
+
+        single_layout.addWidget(QLabel("Replace with:"))
         self.new_entry = QLineEdit()
+        self.new_entry.setPlaceholderText("Replacement text...")
+        self.new_entry.setObjectName("ReplaceEntry")
         self.new_entry.textChanged.connect(self.on_file_select)
-        single_layout.addWidget(self.new_entry, 1, 1)
-        self.tabs.addTab(self.single_tab, "Single replace")
+        single_layout.addWidget(self.new_entry, 1)
+        # shared match options live in the control row below tabs
 
-        # Map Tab
-        self.map_tab = QWidget()
-        map_layout = QHBoxLayout(self.map_tab)
-        self.map_label = QLabel("Map file: (not selected)")
-        map_layout.addWidget(self.map_label)
-        btn_sel_map = QPushButton("Select map file...")
+        self.cb_case = QCheckBox("Aa  Case")
+        self.cb_case.setChecked(False)
+        self.cb_case.setToolTip("Case sensitive matching")
+        self.cb_case.toggled.connect(self.on_file_select)
+
+        self.cb_word = QCheckBox("[ ]  Whole word")
+        self.cb_word.setChecked(False)
+        self.cb_word.setToolTip("Match whole words only (e.g. BOB won't match BOBBY)")
+        self.cb_word.toggled.connect(self.on_file_select)
+
+
+
+        self.tabs.addTab(single_tab, "  Single Replace  ")
+
+        # Map tab
+        map_tab = QWidget()
+        map_layout = QHBoxLayout(map_tab)
+        map_layout.setContentsMargins(12, 10, 12, 10)
+        map_layout.setSpacing(12)
+
+        self.map_label = QLabel("No map file loaded")
+        self.map_label.setObjectName("MapLabel")
+        map_layout.addWidget(self.map_label, 1)
+
+        btn_sel_map = PillButton("Load map file...", "secondary")
         btn_sel_map.clicked.connect(self.on_select_map)
         map_layout.addWidget(btn_sel_map)
-        self.tabs.addTab(self.map_tab, "Map file (old;new)")
 
+        self.tabs.addTab(map_tab, "  Map File (old;new)  ")
         self.tabs.currentChanged.connect(self.on_mode_change)
-        main_layout.addWidget(self.tabs)
 
-        # --- Action Bar ---
-        action_layout = QHBoxLayout()
-        btn_rescan = QPushButton("Rescan files")
-        btn_rescan.clicked.connect(self.on_rescan)
-        action_layout.addWidget(btn_rescan)
+        root.addWidget(self.tabs)
 
-        action_layout.addStretch()
-
-        btn_run = QPushButton("Run Replace (selected files)")
-        btn_run.clicked.connect(self.on_run)
-        # Style the run button
-        btn_run.setStyleSheet("font-weight: bold;")
-        action_layout.addWidget(btn_run)
-
-        main_layout.addLayout(action_layout)
-
-        # --- Main Splitter ---
+        control_row = QHBoxLayout()
+        control_row.setSpacing(10)
+        control_row.addWidget(self.cb_case)
+        control_row.addWidget(self.cb_word)
+        control_row.addStretch()
+        self.btn_run = PillButton("Run Replace on Selected Files", "primary")
+        self.btn_run.clicked.connect(self.on_run)
+        control_row.addWidget(self.btn_run)
+        root.addLayout(control_row)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(self.main_splitter, 1)  # Give it stretch = 1
-
-        # Left Pane: File List
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setChildrenCollapsible(False)
+        root.addWidget(self.main_splitter, 1)
         left_widget = QWidget()
+        left_widget.setObjectName("LeftPane")
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
 
-        left_layout.addWidget(QLabel("Files (selected by default):"))
+        left_layout.addWidget(SectionHeader("FILES"))
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search files...")
+        self.search_input.setPlaceholderText("Filter files...")
+        self.search_input.setObjectName("SearchInput")
         self.search_input.textChanged.connect(self.on_search_changed)
         left_layout.addWidget(self.search_input)
 
         self.file_list = QListWidget()
+        self.file_list.setObjectName("FileList")
+        self.file_list.setAlternatingRowColors(True)
         self.file_list.itemSelectionChanged.connect(self.on_file_select)
         self.file_list.itemDoubleClicked.connect(self.on_file_double_click)
-        left_layout.addWidget(self.file_list)
+        left_layout.addWidget(self.file_list, 1)
 
-        btns_layout = QHBoxLayout()
-        btn_sel_all = QPushButton("Select all")
-        btn_sel_all.clicked.connect(self.select_all)
-        btns_layout.addWidget(btn_sel_all)
+        sel_btns = QHBoxLayout()
+        sel_btns.setSpacing(6)
+        btn_all = PillButton("Select All", "ghost")
+        btn_all.clicked.connect(self.select_all)
+        sel_btns.addWidget(btn_all)
 
-        btn_sel_none = QPushButton("Select none")
-        btn_sel_none.clicked.connect(self.select_none)
-        btns_layout.addWidget(btn_sel_none)
-        left_layout.addLayout(btns_layout)
-
-        self.stats_label = QLabel("0 files")
-        left_layout.addWidget(self.stats_label)
+        btn_none = PillButton("Select None", "ghost")
+        btn_none.clicked.connect(self.select_none)
+        sel_btns.addWidget(btn_none)
+        left_layout.addLayout(sel_btns)
 
         self.main_splitter.addWidget(left_widget)
-
-        # Right Pane: Preview & Log
         right_splitter = QSplitter(Qt.Orientation.Vertical)
+        right_splitter.setHandleWidth(6)
+        right_splitter.setChildrenCollapsible(False)
 
-        # Preview Area (Top Right)
+        # Preview
         preview_widget = QWidget()
+        preview_widget.setObjectName("PreviewPane")
         preview_layout = QVBoxLayout(preview_widget)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(4)
 
-        preview_layout.addWidget(QLabel("Preview (click a file on the left):"))
+        preview_layout.addWidget(SectionHeader("PREVIEW"))
 
         preview_h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        preview_h_splitter.setHandleWidth(4)
 
-        before_widget = QWidget()
-        before_layout = QVBoxLayout(before_widget)
-        before_layout.setContentsMargins(0, 0, 0, 0)
-        before_layout.setSpacing(2)
-        before_layout.addWidget(QLabel("Before"))
+        # Before panel
+        before_frame = QFrame()
+        before_frame.setObjectName("BeforeFrame")
+        before_vl = QVBoxLayout(before_frame)
+        before_vl.setContentsMargins(0, 0, 0, 0)
+        before_vl.setSpacing(0)
+
+        before_header = QLabel("  BEFORE")
+        before_header.setObjectName("BeforeHeader")
+        before_vl.addWidget(before_header)
+
         self.before_text = QTextEdit()
         self.before_text.setReadOnly(True)
-        before_layout.addWidget(self.before_text)
-        preview_h_splitter.addWidget(before_widget)
+        self.before_text.setObjectName("PreviewText")
+        before_vl.addWidget(self.before_text, 1)
+        self.before_text.cursorPositionChanged.connect(self._sync_from_before_preview)
+        preview_h_splitter.addWidget(before_frame)
+        # After panel
+        after_frame = QFrame()
+        after_frame.setObjectName("AfterFrame")
+        after_vl = QVBoxLayout(after_frame)
+        after_vl.setContentsMargins(0, 0, 0, 0)
+        after_vl.setSpacing(0)
 
-        after_widget = QWidget()
-        after_layout = QVBoxLayout(after_widget)
-        after_layout.setContentsMargins(0, 0, 0, 0)
-        after_layout.setSpacing(2)
-        after_layout.addWidget(QLabel("After"))
+        after_header = QLabel("  AFTER")
+        after_header.setObjectName("AfterHeader")
+        after_vl.addWidget(after_header)
+
         self.after_text = QTextEdit()
         self.after_text.setReadOnly(True)
-        after_layout.addWidget(self.after_text)
-        preview_h_splitter.addWidget(after_widget)
+        self.after_text.setObjectName("PreviewText")
+        after_vl.addWidget(self.after_text, 1)
+        self.after_text.cursorPositionChanged.connect(self._sync_from_after_preview)
+        preview_h_splitter.addWidget(after_frame)
 
-        preview_layout.addWidget(preview_h_splitter)
+        preview_layout.addWidget(preview_h_splitter, 1)
 
         self.match_label = QLabel("")
+        self.match_label.setObjectName("MatchLabel")
         preview_layout.addWidget(self.match_label)
 
         right_splitter.addWidget(preview_widget)
 
-        # Log Area (Bottom Right)
+        # Log panel
         log_widget = QWidget()
+        log_widget.setObjectName("LogPane")
         log_layout = QVBoxLayout(log_widget)
         log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.setSpacing(2)
-        log_layout.addWidget(QLabel("Log:"))
-        self.log_text = QTextEdit()
+        log_layout.setSpacing(4)
+
+        log_layout.addWidget(SectionHeader("LOG"))
+
+        self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
+        self.log_text.setObjectName("LogText")
+        log_layout.addWidget(self.log_text, 1)
 
         right_splitter.addWidget(log_widget)
+        right_splitter.setSizes([520, 160])
 
-        # Set splitter sizes
-        right_splitter.setSizes([400, 150])
         self.main_splitter.addWidget(right_splitter)
-        self.main_splitter.setSizes([300, 800])
+        self.main_splitter.setSizes([300, 900])
 
         # Apply initial theme
         self.apply_theme(is_dark=False)
 
-    def toggle_theme(self, checked):
+    def _make_divider(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("Divider")
+        return line
+
+    def _make_vline(self) -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.VLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        line.setObjectName("Divider")
+        return line
+
+    def _on_theme_toggle(self, checked: bool):
+        self._is_dark = checked
+        self.theme_btn.setText("Dark" if checked else "Light")
         self.apply_theme(is_dark=checked)
 
     def apply_theme(self, is_dark: bool):
         app = QApplication.instance()
-        if not is_dark:
-            # Clean, Antigravity-style Light Palette
-            light_palette = QPalette()
-            light_palette.setColor(QPalette.ColorRole.Window, QColor(245, 245, 245))
-            light_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.black)
-            light_palette.setColor(QPalette.ColorRole.Base, Qt.GlobalColor.white)
-            light_palette.setColor(QPalette.ColorRole.AlternateBase, QColor(250, 250, 250))
-            light_palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
-            light_palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.black)
-            light_palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.black)
-            light_palette.setColor(QPalette.ColorRole.Button, QColor(235, 235, 235))
-            light_palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
-            light_palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-            light_palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-            light_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-            light_palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
 
-            app.setPalette(light_palette)
-            # Make splitters clearly visible and 4px wide/tall
-            app.setStyleSheet("""
-                QSplitter::handle {
-                    background-color: #d4d4d4;
-                    margin: 2px;
-                    border-radius: 2px;
-                }
-                QSplitter::handle:horizontal {
-                    width: 6px;
-                }
-                QSplitter::handle:vertical {
-                    height: 6px;
-                }
-            """)
-            return
+        if is_dark:
+            bg          = "#1e1e2e"
+            bg_mid      = "#252535"
+            bg_input    = "#16161f"
+            bg_alt      = "#1a1a28"
+            fg          = "#cdd6f4"
+            fg_muted    = "#7f849c"
+            border      = "#45475a"
+            accent      = "#89b4fa"
+            accent_fg   = "#1e1e2e"
+            primary_btn = "#89b4fa"
+            primary_fg  = "#1e1e2e"
+            before_hdr  = "#3d2a1a"
+            before_txt  = "#e07b00"
+            after_hdr   = "#1a3020"
+            after_txt   = "#2e9e4f"
+            splitter_c  = "#313244"
+            tab_bg      = "#252535"
+            tab_sel     = "#1e1e2e"
+            log_bg      = "#16161f"
+        else:
+            bg          = "#f4f4f8"
+            bg_mid      = "#ffffff"
+            bg_input    = "#ffffff"
+            bg_alt      = "#eeeef4"
+            fg          = "#2a2a3d"
+            fg_muted    = "#888899"
+            border      = "#d0d0de"
+            accent      = "#4c6ef5"
+            accent_fg   = "#ffffff"
+            primary_btn = "#4c6ef5"
+            primary_fg  = "#ffffff"
+            before_hdr  = "#fff3e0"
+            before_txt  = "#c25a00"
+            after_hdr   = "#e8f5e9"
+            after_txt   = "#1b7a36"
+            splitter_c  = "#d0d0de"
+            tab_bg      = "#ebebf3"
+            tab_sel     = "#ffffff"
+            log_bg      = "#fafafa"
 
-        # Setup Dark Palette
-        dark_palette = QPalette()
-        dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
-        dark_palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-        dark_palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window,         QColor(bg))
+        palette.setColor(QPalette.ColorRole.WindowText,     QColor(fg))
+        palette.setColor(QPalette.ColorRole.Base,           QColor(bg_input))
+        palette.setColor(QPalette.ColorRole.AlternateBase,  QColor(bg_alt))
+        palette.setColor(QPalette.ColorRole.Text,           QColor(fg))
+        palette.setColor(QPalette.ColorRole.Button,         QColor(bg_mid))
+        palette.setColor(QPalette.ColorRole.ButtonText,     QColor(fg))
+        palette.setColor(QPalette.ColorRole.Highlight,      QColor(accent))
+        palette.setColor(QPalette.ColorRole.HighlightedText,QColor(accent_fg))
+        palette.setColor(QPalette.ColorRole.ToolTipBase,    QColor(bg_mid))
+        palette.setColor(QPalette.ColorRole.ToolTipText,    QColor(fg))
+        app.setPalette(palette)
 
-        app.setPalette(dark_palette)
+        mono = "Consolas, 'Courier New', monospace"
 
-        # Adjust tooltip styling for dark mode readability and visible splitters
-        app.setStyleSheet("""
-            QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; }
-            QSplitter::handle {
-                background-color: #777777;
-                margin: 2px;
-                border-radius: 2px;
-            }
-            QSplitter::handle:horizontal {
-                width: 6px;
-            }
-            QSplitter::handle:vertical {
-                height: 6px;
-            }
+        app.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background: {bg};
+                color: {fg};
+                font-family: 'Segoe UI', 'SF Pro Display', Helvetica, Arial, sans-serif;
+                font-size: 13px;
+            }}
+            #FolderBar {{
+                background: {bg_mid};
+                border: 1px solid {border};
+                border-radius: 6px;
+            }}
+            #FolderTag {{
+                color: {accent};
+                background: {bg_input};
+                border: 1px solid {border};
+                border-radius: 4px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 3px 0;
+                min-width: 36px;
+            }}
+            #FolderPathEdit {{
+                background: transparent;
+                border: none;
+                color: {fg};
+                font-size: 12px;
+                padding: 0 4px;
+            }}
+            #FolderPathEdit:focus {{ outline: none; border: none; }}
+            #OptionLabel {{ color: {fg_muted}; font-size: 12px; }}
+            #ExtEntry {{
+                background: {bg_input};
+                border: 1px solid {border};
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: {fg};
+                font-size: 12px;
+                font-family: {mono};
+            }}
+            #ExtEntry:focus {{ border-color: {accent}; }}
+            #ThemeToggle {{
+                background: transparent;
+                border: 1px solid {border};
+                border-radius: 14px;
+                padding: 3px 12px;
+                color: {fg_muted};
+                font-size: 12px;
+            }}
+            #ThemeToggle:hover {{ border-color: {accent}; color: {accent}; }}
+            #ThemeToggle:checked {{ background: {accent}; color: {accent_fg}; border-color: {accent}; }}
+            #Divider {{ background: {border}; max-height: 1px; border: none; }}
+            #ReplaceTabs {{
+                background: {bg};
+            }}
+            #ReplaceTabs::pane {{
+                border: 1px solid {border};
+                border-radius: 0 6px 6px 6px;
+                background: {tab_sel};
+                top: -1px;
+            }}
+            #ReplaceTabs QTabBar {{
+                background: transparent;
+            }}
+            #ReplaceTabs QTabBar::tab {{
+                background: {tab_bg};
+                color: {fg_muted};
+                border: 1px solid {border};
+                border-bottom: none;
+                border-radius: 6px 6px 0 0;
+                padding: 7px 18px;
+                margin-right: 3px;
+                font-size: 12px;
+                font-weight: 500;
+                min-width: 120px;
+            }}
+            #ReplaceTabs QTabBar::tab:selected {{
+                background: {tab_sel};
+                color: {accent};
+                border-bottom: 2px solid {accent};
+                font-weight: 600;
+            }}
+            #ReplaceTabs QTabBar::tab:hover:!selected {{ color: {fg}; }}
+            #FindEntry, #ReplaceEntry {{
+                background: {bg_input};
+                border: 1px solid {border};
+                border-radius: 5px;
+                padding: 6px 10px;
+                color: {fg};
+                font-size: 13px;
+            }}
+            #FindEntry:focus, #ReplaceEntry:focus {{ border-color: {accent}; }}
+            #ArrowLabel {{ color: {fg_muted}; font-size: 16px; font-weight: 300; }}
+            #MapLabel {{ color: {fg_muted}; font-size: 12px; font-style: italic; }}
+            #PillButton_primary {{
+                background: {primary_btn};
+                color: {primary_fg};
+                border: none;
+                border-radius: 6px;
+                padding: 8px 20px;
+                font-weight: 700;
+                font-size: 13px;
+                letter-spacing: 0.3px;
+            }}
+            #PillButton_primary:hover {{ background: {accent}; }}
+            #PillButton_primary:pressed {{ opacity: 0.85; }}
+
+            #PillButton_secondary {{
+                background: {bg_mid};
+                color: {fg};
+                border: 1px solid {border};
+                border-radius: 6px;
+                padding: 7px 16px;
+                font-size: 13px;
+            }}
+            #PillButton_secondary:hover {{ border-color: {accent}; color: {accent}; }}
+
+            #PillButton_ghost {{
+                background: transparent;
+                color: {fg_muted};
+                border: 1px solid {border};
+                border-radius: 5px;
+                padding: 5px 12px;
+                font-size: 12px;
+            }}
+            #PillButton_ghost:hover {{ color: {fg}; border-color: {fg_muted}; }}
+            #SectionHeader {{
+                color: {fg_muted};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1.2px;
+                padding: 4px 2px 2px 2px;
+            }}
+            #LeftPane {{ padding: 0; }}
+            #SearchInput {{
+                background: {bg_input};
+                border: 1px solid {border};
+                border-radius: 5px;
+                padding: 6px 10px;
+                color: {fg};
+                font-size: 12px;
+            }}
+            #SearchInput:focus {{ border-color: {accent}; }}
+
+            #FileList {{
+                background: {bg_input};
+                border: 1px solid {border};
+                border-radius: 5px;
+                alternate-background-color: {bg_alt};
+                outline: none;
+            }}
+            #FileList::item {{
+                padding: 5px 8px;
+                border-radius: 3px;
+                font-size: 12px;
+                font-family: {mono};
+            }}
+            #FileList::item:selected {{
+                background: {accent};
+                color: {accent_fg};
+            }}
+            #FileList::item:hover:!selected {{ background: {bg_alt}; }}
+            #BeforeHeader {{
+                background: {before_hdr};
+                color: {before_txt};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 5px 10px;
+                border-bottom: 1px solid {border};
+            }}
+            #AfterHeader {{
+                background: {after_hdr};
+                color: {after_txt};
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                padding: 5px 10px;
+                border-bottom: 1px solid {border};
+            }}
+            #PreviewText {{
+                background: {bg_input};
+                border: 1px solid {border};
+                border-top: none;
+                font-family: {mono};
+                font-size: 12px;
+                color: {fg};
+                padding: 6px;
+            }}
+            #MatchLabel {{
+                color: {fg_muted};
+                font-size: 11px;
+                padding: 2px 4px;
+                font-family: {mono};
+            }}
+            #LogText {{
+                background: {log_bg};
+                border: 1px solid {border};
+                border-radius: 5px;
+                font-family: {mono};
+                font-size: 11px;
+                color: {fg};
+                padding: 6px;
+            }}
+            QSplitter::handle {{
+                background: {splitter_c};
+                border-radius: 3px;
+            }}
+            QSplitter::handle:horizontal {{ width: 6px; }}
+            QSplitter::handle:vertical   {{ height: 6px; }}
+            QSplitter::handle:hover {{ background: {accent}; }}
+            QScrollBar:vertical {{
+                background: {bg_alt};
+                width: 8px;
+                border-radius: 4px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {border};
+                border-radius: 4px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {accent}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar:horizontal {{
+                background: {bg_alt};
+                height: 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {border};
+                border-radius: 4px;
+                min-width: 24px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background: {accent}; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+            QCheckBox {{
+                spacing: 6px;
+                font-size: 12px;
+                color: {fg};
+            }}
+            QCheckBox::indicator {{
+                width: 15px;
+                height: 15px;
+                border: 1px solid {border};
+                border-radius: 3px;
+                background: {bg_input};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {accent};
+                border-color: {accent};
+            }}
+            #AppStatusBar {{
+                background: {bg_mid};
+                border-top: 1px solid {border};
+                color: {fg_muted};
+                font-size: 11px;
+                padding: 0 8px;
+            }}
         """)
 
-    # -----------------------------
-    # Drag and Drop Events
-    # -----------------------------
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -534,17 +1052,15 @@ class BulkReplaceApp(QMainWindow):
         if urls:
             path = urls[0].toLocalFile()
             if os.path.isfile(path):
-                # If a map file is dragged while Map Tab is open, load it as map file instead of setting folder
                 if self.tabs.currentIndex() == 1 and path.lower().endswith(".txt"):
                     self._load_dropped_map_file(path)
                 else:
-                    # Otherwise treat it as selecting the parent folder for source files
                     self.source_folder = os.path.dirname(path)
-                    self.folder_label.setText(f"Folder: {self.source_folder}")
+                    self.folder_bar.path_edit.setText(self.source_folder)
                     self.on_rescan()
             elif os.path.isdir(path):
                 self.source_folder = path
-                self.folder_label.setText(f"Folder: {self.source_folder}")
+                self.folder_bar.path_edit.setText(path)
                 self.on_rescan()
         super().dropEvent(event)
 
@@ -560,76 +1076,94 @@ class BulkReplaceApp(QMainWindow):
 
         duplicates = check_duplicate_new_names(repl)
         if duplicates:
-            msg = "Pronađeni duplikati u 'novim' imenima:\n\n"
+            msg = "Pronadjeni duplikati u 'novim' imenima:\n\n"
             for new, olds in duplicates.items():
                 msg += f"'{new}' dobijaju: {', '.join(olds)}\n"
-            QMessageBox.critical(self, "Duplikati pronađeni", msg)
+            QMessageBox.critical(self, "Duplikati pronadjeni", msg)
             return
 
         self.map_file_path = path
         self.replacements_map = repl
-        self.map_label.setText(f"Map file: {path}  ({len(repl)} pairs)")
+        name = os.path.basename(path)
+        self.map_label.setText(f"OK: {name}   ({len(repl)} pairs)")
 
         if warnings:
-            self.log_text.append("Map file warnings:")
+            self.log_text.appendPlainText("Map file warnings:")
             for w in warnings:
-                self.log_text.append(f"  - {w}")
-            self.log_text.append("")
+                self.log_text.appendPlainText(f"  - {w}")
+            self.log_text.appendPlainText("")
 
-        self.clear_preview()
+        if self.source_folder:
+            self.on_rescan()
+        else:
+            self._select_first_visible_file()
 
     def get_mode(self):
         return "single" if self.tabs.currentIndex() == 0 else "map"
 
     def on_mode_change(self):
-        self.clear_preview()
+        self._select_first_visible_file()
 
     def on_select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if not folder:
             return
         self.source_folder = folder
-        self.folder_label.setText(f"Folder: {folder}")
+        self.folder_bar.path_edit.setText(folder)
         self.on_rescan()
 
     def on_select_map(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select map file (old;new)",
-            "",
+            self, "Select map file (old;new)", "",
             "Text files (*.txt);;All files (*.*)"
         )
         if not path:
             return
 
-        repl, warnings = load_replacements_map(path)
-        if repl is None:
-            QMessageBox.critical(self, "Error", warnings)
+        self._load_dropped_map_file(path)
+
+    def _auto_rescan(self, *_):
+        if self.source_folder:
+            self.on_rescan()
+
+    def _select_first_visible_file(self):
+        if self.file_list.count() == 0:
+            self.clear_preview()
             return
 
-        if not repl:
-            QMessageBox.warning(self, "Empty map", "Map file is empty or has no valid pairs.")
+        selected = self.file_list.selectedItems()
+        if selected:
+            item = selected[0]
+            if not item.isHidden() and item.checkState() == Qt.CheckState.Checked:
+                self.on_file_select()
+                return
+
+        first_visible = None
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item.isHidden():
+                continue
+            if first_visible is None:
+                first_visible = item
+            if item.checkState() == Qt.CheckState.Checked:
+                self.file_list.setCurrentItem(item)
+                self.on_file_select()
+                return
+
+        if first_visible is not None:
+            self.file_list.setCurrentItem(first_visible)
+            self.on_file_select()
             return
-
-        duplicates = check_duplicate_new_names(repl)
-        if duplicates:
-            msg = "Pronađeni duplikati u 'novim' imenima:\n\n"
-            for new, olds in duplicates.items():
-                msg += f"'{new}' dobijaju: {', '.join(olds)}\n"
-            QMessageBox.critical(self, "Duplikati pronađeni", msg)
-            return
-
-        self.map_file_path = path
-        self.replacements_map = repl
-        self.map_label.setText(f"Map file: {path}  ({len(repl)} pairs)")
-
-        if warnings:
-            self.log_text.append("Map file warnings:")
-            for w in warnings:
-                self.log_text.append(f"  - {w}")
-            self.log_text.append("")
 
         self.clear_preview()
+
+    def _should_check_file_by_default(self, path: str) -> bool:
+        if not self.map_file_path:
+            return True
+        try:
+            return os.path.abspath(path) != os.path.abspath(self.map_file_path)
+        except Exception:
+            return True
 
     def on_rescan(self):
         if not self.source_folder:
@@ -644,46 +1178,88 @@ class BulkReplaceApp(QMainWindow):
             rel = os.path.relpath(p, self.source_folder)
             item = QListWidgetItem(rel)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked)
+            item.setCheckState(Qt.CheckState.Checked if self._should_check_file_by_default(p) else Qt.CheckState.Unchecked)
             self.file_list.addItem(item)
 
-        # Re-apply current search filter if any
         if self.search_input.text():
             self.on_search_changed(self.search_input.text())
-
-        self.stats_label.setText(f"{len(self.file_paths)} files found")
-        self.clear_preview()
+        self._select_first_visible_file()
+        count = len(self.file_paths)
+        self._status_file_count.setText(f"  {count} file{'s' if count != 1 else ''} found")
 
     def on_search_changed(self, text: str):
-        search_term = text.lower()
+        term = text.lower()
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
-            # If search term is empty or term is in the item text, show it. Otherwise hide it.
-            item.setHidden(search_term not in item.text().lower())
+            item.setHidden(term not in item.text().lower())
+        self._select_first_visible_file()
 
     def select_all(self):
         for i in range(self.file_list.count()):
             self.file_list.item(i).setCheckState(Qt.CheckState.Checked)
+
 
     def select_none(self):
         for i in range(self.file_list.count()):
             self.file_list.item(i).setCheckState(Qt.CheckState.Unchecked)
 
     def clear_preview(self):
+        self._before_example_positions = []
+        self._after_example_positions = []
         self.before_text.clear()
         self.after_text.clear()
         self.match_label.setText("")
+        self._status_match.setText("")
 
     def _validate_ready_for_preview(self):
         mode = self.get_mode()
         if mode == "single":
-            old = self.old_entry.text()
-            new = self.new_entry.text()
-            return True, mode, old, new
+            return True, mode, self.old_entry.text(), self.new_entry.text()
         else:
             if not self.replacements_map:
                 return False, mode, "", ""
             return True, mode, "", ""
+
+    def _preview_example_index_for_cursor(self, widget: QTextEdit, positions: list[int]):
+        if not positions:
+            return None
+        block_number = widget.textCursor().blockNumber()
+        idx = 0
+        for i, start_block in enumerate(positions):
+            if start_block <= block_number:
+                idx = i
+            else:
+                break
+        return idx
+
+    def _sync_preview_to_example(self, source: QTextEdit, target: QTextEdit, source_positions: list[int], target_positions: list[int]):
+        if self._syncing_preview or not self._preview_sync_enabled:
+            return
+        idx = self._preview_example_index_for_cursor(source, source_positions)
+        if idx is None or idx >= len(target_positions):
+            return
+        self._syncing_preview = True
+        try:
+            block = target.document().findBlockByNumber(target_positions[idx])
+            if not block.isValid():
+                return
+            cursor = target.textCursor()
+            cursor.setPosition(block.position())
+            target.setTextCursor(cursor)
+            target.ensureCursorVisible()
+        finally:
+            self._syncing_preview = False
+
+    def _sync_from_before_preview(self):
+        self._sync_preview_to_example(self.before_text, self.after_text, self._before_example_positions, self._after_example_positions)
+
+    def _sync_from_after_preview(self):
+        self._sync_preview_to_example(self.after_text, self.before_text, self._after_example_positions, self._before_example_positions)
+
+    def _append_preview_example(self, widget: QTextEdit, positions: list[int], header: str, preview_payload):
+        start_block = self._append_example_header(widget, header)
+        positions.append(start_block)
+        self._append_preview_content(widget, preview_payload)
 
     def on_file_select(self):
         if not self.source_folder or not self.file_paths:
@@ -701,96 +1277,155 @@ class BulkReplaceApp(QMainWindow):
 
         ok, mode, old, new = self._validate_ready_for_preview()
 
-        text = read_text_file(file_path)
-        if text is None:
+        file_info = read_text_file(file_path)
+        if file_info is None:
             self.before_text.clear()
             self.after_text.clear()
-            self.match_label.setText(f"{rel} (binary/unreadable skipped)")
+            msg = f"{rel}  (binary / unreadable - skipped)"
+            self.match_label.setText(msg)
+            self._status_match.setText(msg)
             return
 
-        self.before_text.clear()
-        self.after_text.clear()
+        text, _, _ = file_info
 
-        if not ok:
-            self.before_text.setPlainText("Select / load a map file to see preview.\n")
-            self.after_text.setPlainText("Select / load a map file to see preview.\n")
-            self.match_label.setText(f"{rel}")
-            return
+        self._preview_sync_enabled = False
+        try:
+            self.clear_preview()
 
-        if mode == "single":
-            if not old:
-                self.before_text.setPlainText("Enter 'Text to replace' to see preview.\n")
-                self.after_text.setPlainText("Enter 'Text to replace' to see preview.\n")
-                self.match_label.setText(f"{rel} — matches: 0")
+            if not ok:
+                self.before_text.setPlainText("Select / load a map file to see preview.")
+                self.after_text.setPlainText("Select / load a map file to see preview.")
+                self.match_label.setText(rel)
                 return
 
-            count = text.count(old)
-            examples = build_preview_single(text, old, new, max_examples=5, context=60)
+            if mode == "single":
+                if not old:
+                    self.before_text.setPlainText("Enter 'Find' text to see preview.")
+                    self.after_text.setPlainText("Enter 'Find' text to see preview.")
+                    self.match_label.setText(f"{rel}  -  matches: 0")
+                    return
 
-            if count == 0:
-                self.before_text.setPlainText("No matches in this file.\n")
-                self.after_text.setPlainText("No changes.\n")
-                self.match_label.setText(f"{rel} — matches: 0")
-                return
+                cs = self.cb_case.isChecked()
+                ww = self.cb_word.isChecked()
 
-            self.match_label.setText(f"{rel} — matches: {count} (showing up to {len(examples)} examples)")
-            for i, (b, a) in enumerate(examples, start=1):
-                self.before_text.append(f"--- Example {i} ---")
-                self._append_html(self.before_text, b)
-                self.before_text.append("")
+                try:
+                    pat = _make_pattern(old, cs, ww)
+                except re.error:
+                    self.before_text.setPlainText("Invalid search pattern.")
+                    self.after_text.setPlainText("")
+                    return
 
-                self.after_text.append(f"--- Example {i} ---")
-                self._append_html(self.after_text, a)
-                self.after_text.append("")
+                count = len(pat.findall(text))
+                examples = build_preview_single(
+                    text, old, new,
+                    case_sensitive=cs,
+                    whole_word=ww,
+                    max_examples=5,
+                    context=60,
+                )
 
-        else:
-            total_after_text, total_count, per = apply_replacements(
-                text, "map", "", "", self.replacements_map
-            )
-            examples = build_preview_map(text, self.replacements_map, max_examples=6, context=60)
+                if count == 0:
+                    self.before_text.setPlainText("No matches in this file.")
+                    self.after_text.setPlainText("No changes.")
+                    msg = f"{rel}  -  matches: 0"
+                    self.match_label.setText(msg)
+                    self._status_match.setText(msg)
+                    return
 
-            if total_count == 0:
-                self.before_text.setPlainText("No matches for any map pair in this file.\n")
-                self.after_text.setPlainText("No changes.\n")
-                self.match_label.setText(f"{rel} — total matches: 0")
-                return
+                msg = f"{rel}  -  {count} match{'es' if count != 1 else ''}  (showing up to {len(examples)} examples)"
+                self.match_label.setText(msg)
+                self._status_match.setText(msg)
 
-            top_pairs = sorted(per.items(), key=lambda kv: kv[1], reverse=True)[:8]
-            top_txt = ", ".join([f"{k} ({v})" for k, v in top_pairs])
+                for i, (b, a) in enumerate(examples, start=1):
+                    self._append_preview_example(self.before_text, self._before_example_positions, f"-- Example {i} --", b)
+                    self._append_preview_example(self.after_text, self._after_example_positions, f"-- Example {i} --", a)
+            else:
+                cs = self.cb_case.isChecked()
+                ww = self.cb_word.isChecked()
 
-            self.match_label.setText(f"{rel} — total matches: {total_count} | top: {top_txt}")
+                _, total_count, per = apply_replacements(
+                    text, "map", "", "", self.replacements_map,
+                    case_sensitive=cs, whole_word=ww
+                )
+                examples = build_preview_map(
+                    text, self.replacements_map,
+                    case_sensitive=cs, whole_word=ww,
+                    max_examples=20, context=60
+                )
 
-            if not examples:
-                self.before_text.setPlainText("Matches exist, but no short examples could be built.\n")
-                self.after_text.setPlainText("Try adjusting context or map pairs.\n")
-                return
+                if total_count == 0:
+                    self.before_text.setPlainText("No matches for any map pair in this file.")
+                    self.after_text.setPlainText("No changes.")
+                    msg = f"{rel}  -  total matches: 0"
+                    self.match_label.setText(msg)
+                    self._status_match.setText(msg)
+                    return
 
-            for i, (label, b, a) in enumerate(examples, start=1):
-                self.before_text.append(f"--- Example {i}: {label} ---")
-                self._append_html(self.before_text, b)
-                self.before_text.append("")
+                shown = len(examples)
+                suffix = f"  (showing {shown} of {total_count})" if shown < total_count else f"  ({shown} shown)"
+                top_pairs = sorted(per.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                top_txt = ",  ".join([f"{k}: {v}" for k, v in top_pairs])
+                msg = f"{rel}  -  {total_count} total{suffix}  |  {top_txt}"
+                self.match_label.setText(msg)
+                self._status_match.setText(f"{rel}  -  {total_count} matches")
 
-                self.after_text.append(f"--- Example {i}: {label} ---")
-                self._append_html(self.after_text, a)
-                self.after_text.append("")
+                if not examples:
+                    self.before_text.setPlainText("Matches exist, but no short examples could be built.")
+                    self.after_text.setPlainText("Try adjusting context or map pairs.")
+                    return
 
-    def _append_html(self, widget, html: str):
-        """Append rich HTML content to a QTextEdit reliably using QTextCursor."""
+                for i, (label, b, a) in enumerate(examples, start=1):
+                    self._append_preview_example(self.before_text, self._before_example_positions, f"-- {i}. {label} --", b)
+                    self._append_preview_example(self.after_text, self._after_example_positions, f"-- {i}. {label} --", a)
+        finally:
+            self._preview_sync_enabled = True
+
+    def _append_preview_content(self, widget: QTextEdit, preview_payload):
+        snippet, spans, bg_color, text_color = preview_payload
         cursor = widget.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        plain_format = QTextCharFormat()
+        plain_format.setForeground(widget.palette().text().color())
+
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QColor(bg_color))
+        highlight_format.setForeground(QColor(text_color))
+
+        snippet_cursor = 0
+        for start, end in spans:
+            if start > snippet_cursor:
+                cursor.insertText(snippet[snippet_cursor:start], plain_format)
+            cursor.insertText(snippet[start:end], highlight_format)
+            snippet_cursor = end
+
+        if snippet_cursor < len(snippet):
+            cursor.insertText(snippet[snippet_cursor:], plain_format)
+
         cursor.insertBlock()
-        cursor.insertHtml(html)
         widget.setTextCursor(cursor)
+
+    def _append_example_header(self, widget: QTextEdit, text: str):
+        cursor = widget.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        if cursor.position() > 0:
+            cursor.insertBlock()
+            cursor.insertBlock()
+
+        header_format = QTextCharFormat()
+        header_format.setForeground(QColor("#888899"))
+        cursor.insertText(text, header_format)
+        cursor.insertBlock()
+        widget.setTextCursor(cursor)
+        return cursor.blockNumber()
 
     def on_file_double_click(self, item: QListWidgetItem):
         idx = self.file_list.row(item)
-        if idx >= 0 and idx < len(self.file_paths):
-            file_path = self.file_paths[idx]
-            # Use os.startfile on Windows to open the file completely asynchronously
-            # avoiding any blocking behavior or tying to the parent process
+        if 0 <= idx < len(self.file_paths):
             try:
-                os.startfile(os.path.abspath(file_path))
-            except Exception as e:
+                os.startfile(os.path.abspath(self.file_paths[idx]))
+            except Exception:
                 pass
 
     def on_run(self):
@@ -804,17 +1439,17 @@ class BulkReplaceApp(QMainWindow):
             old = self.old_entry.text()
             new = self.new_entry.text()
             if not old:
-                QMessageBox.warning(self, "Input error", "Text to replace cannot be empty.")
+                QMessageBox.warning(self, "Input error", "Find text cannot be empty.")
                 return
         else:
             if not self.replacements_map:
-                QMessageBox.warning(self, "Map missing", "Please select and load a map file first.")
+                QMessageBox.warning(self, "Map missing", "Please load a map file first.")
                 return
 
-        selected_indices = []
-        for i in range(self.file_list.count()):
-            if self.file_list.item(i).checkState() == Qt.CheckState.Checked:
-                selected_indices.append(i)
+        selected_indices = [
+            i for i in range(self.file_list.count())
+            if self.file_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
 
         if not selected_indices:
             QMessageBox.warning(self, "No files", "No files selected.")
@@ -822,9 +1457,11 @@ class BulkReplaceApp(QMainWindow):
 
         folder_name = os.path.basename(self.source_folder.rstrip(os.sep))
         dest_folder = os.path.join(os.path.dirname(self.source_folder), folder_name + "_CLEAN")
-        os.makedirs(dest_folder, exist_ok=True)
 
         self.log_text.clear()
+        if os.path.isdir(dest_folder):
+            shutil.rmtree(dest_folder)
+        os.makedirs(dest_folder, exist_ok=True)
 
         total_repl = 0
         changed_files = 0
@@ -837,43 +1474,58 @@ class BulkReplaceApp(QMainWindow):
             if mode == "map" and self.map_file_path:
                 try:
                     if os.path.abspath(src_path) == os.path.abspath(self.map_file_path):
-                        self.log_text.append(f"[SKIP] Map file: {rel}")
+                        self.log_text.appendPlainText(f"[SKIP] Map file: {rel}")
                         continue
                 except Exception:
                     pass
 
-            text = read_text_file(src_path)
-            if text is None:
+            file_info = read_text_file(src_path)
+            if file_info is None:
                 skipped += 1
                 continue
 
+            text, src_encoding, src_newline = file_info
+
             if mode == "single":
-                out_text, count, _ = apply_replacements(text, "single", old, new, {})
+                out_text, count, _ = apply_replacements(
+                    text, "single", old, new, {},
+                    case_sensitive=self.cb_case.isChecked(),
+                    whole_word=self.cb_word.isChecked()
+                )
             else:
-                out_text, count, _ = apply_replacements(text, "map", "", "", self.replacements_map)
+                out_text, count, _ = apply_replacements(
+                    text, "map", "", "", self.replacements_map,
+                    case_sensitive=self.cb_case.isChecked(),
+                    whole_word=self.cb_word.isChecked()
+                )
 
             if count == 0:
                 continue
 
             out_path = os.path.join(dest_folder, rel)
-            write_text_file(out_path, out_text)
+            write_text_file(out_path, out_text, encoding=src_encoding, newline=src_newline)
 
             total_repl += count
             changed_files += 1
-            self.log_text.append(f"{rel}: {count} replacements")
+            self.log_text.appendPlainText(f"{rel}: {count} replacement{'s' if count != 1 else ''}")
 
-        self.log_text.append("\n--- DONE ---")
-        self.log_text.append(f"Changed files: {changed_files}")
-        self.log_text.append(f"Total replacements: {total_repl}")
+        self.log_text.appendPlainText("\n-- DONE -----------------------------")
+        self.log_text.appendPlainText(f"Changed files   : {changed_files}")
+        self.log_text.appendPlainText(f"Total replacements: {total_repl}")
         if skipped:
-            self.log_text.append(f"Skipped (binary/unreadable): {skipped}")
-        self.log_text.append(f"Output folder: {dest_folder}")
+            self.log_text.appendPlainText(f"Skipped (binary): {skipped}")
+        self.log_text.appendPlainText(f"Output folder   : {dest_folder}")
 
-        QMessageBox.information(self, "Completed", "Replacement finished. See log for details.")
+        self._status_file_count.setText(
+            f"  Done - {changed_files} file{'s' if changed_files != 1 else ''} changed, "
+            f"{total_repl} replacements"
+        )
 
+        QMessageBox.information(self, "Completed", "Replacement finished.\nSee the log panel for details.")
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(load_app_icon())
     app.setStyle("Fusion")
     window = BulkReplaceApp()
     window.show()
@@ -882,3 +1534,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
